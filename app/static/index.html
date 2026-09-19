@@ -39,6 +39,18 @@
   #wordlist { font-size:11px; color:var(--dim); line-height:1.8; word-break:break-all; }
   #wordlist span { display:inline-block; background:#101216; border:1px solid var(--border); border-radius:4px; padding:0 5px; margin:1px 2px; }
   #wordlist span i { color:var(--accent); font-style:normal; margin-right:3px; }
+  #gaplist { font-size:12px; line-height:2.2; word-break:break-all; }
+  #gaplist .w { display:inline-block; background:#101216; border:1px solid var(--border); border-radius:4px; padding:0 5px; margin:1px 0; }
+  #gaplist .w i { color:var(--accent); font-style:normal; margin-right:3px; font-size:10px; }
+  #gaplist .gap { display:inline-block; min-width:20px; text-align:center; cursor:pointer; color:var(--dim); border-radius:4px; margin:0 1px; user-select:none; font-size:11px; }
+  #gaplist .gap:hover { background:#262b33; }
+  #gaplist .gap.must { color:var(--bad); background:#2a1518; }
+  #gaplist .gap.no { color:#7ee2a8; background:#14251b; }
+  #gaplist .gap.lock { cursor:not-allowed; opacity:0.35; }
+  #gaplist .gap.sol { box-shadow:inset 0 -2px 0 var(--accent); }
+  #gaplist .gap.conflict { outline:1px solid var(--bad); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { background:#4a1d22; } }
+  .lg.must { color:var(--bad); } .lg.no { color:#7ee2a8; }
 </style>
 </head>
 <body>
@@ -63,6 +75,12 @@
 人工智能"></textarea>
       <div class="hint">每行一个:词下标区间(如 <code>3-6</code>,含端点)或短语原文(自动匹配首个连续出现)。下标见下方词序列预览。</div>
       <div id="wordlist" style="margin-top:8px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>边界约束</h2>
+      <div id="gaplist"><span class="hint">粘贴词序列后,点击词间隙设置约束。</span></div>
+      <div class="hint">点击词间隙循环切换:<span class="lg must">✂ 必须断开</span> → <span class="lg no">🔗 禁止断开</span> → 清除。不可拆短语内部的间隙不可设置;蓝色下划线表示当前方案的实际断点。</div>
     </div>
 
     <div class="panel">
@@ -157,6 +175,69 @@ function fmt(t) {
 let timer = null;
 function schedule() { clearTimeout(timer); timer = setTimeout(run, 250); }
 
+// 边界约束状态: gapState[词间隙下标] = "must" | "no";solBreaks = 当前方案实际断点;conflictGap = 冲突边界
+let gapState = {};
+let solBreaks = new Set();
+let conflictGap = null;
+
+function phraseInnerGaps(phrases) {
+  const inner = new Set();
+  for (const ph of phrases) for (let i = ph[0] + 1; i <= ph[ph.length - 1]; i++) inner.add(i);
+  return inner;
+}
+
+function pruneGaps(words, phrases) {
+  const inner = phraseInnerGaps(phrases);
+  for (const k of Object.keys(gapState)) {
+    const i = +k;
+    if (i < 1 || i >= words.length || inner.has(i)) delete gapState[i];
+  }
+}
+
+function renderGapList(words, phrases) {
+  if (!words.length) {
+    $("gaplist").innerHTML = '<span class="hint">粘贴词序列后,点击词间隙设置约束。</span>';
+    return;
+  }
+  const inner = phraseInnerGaps(phrases);
+  let html = "";
+  words.forEach((w, i) => {
+    if (i > 0) {
+      const st = gapState[i], cls = ["gap"];
+      let label = "·", tip = `词间隙 ${i}`;
+      if (inner.has(i)) { cls.push("lock"); tip += "(不可拆短语内部)"; }
+      else if (st === "must") { cls.push("must"); label = "✂"; tip += " · 必须断开"; }
+      else if (st === "no") { cls.push("no"); label = "🔗"; tip += " · 禁止断开"; }
+      if (solBreaks.has(i)) cls.push("sol");
+      if (conflictGap === i) cls.push("conflict");
+      html += `<span class="${cls.join(" ")}" data-gap="${i}" title="${tip}">${label}</span>`;
+    }
+    html += `<span class="w"><i>${i}</i>${w.text}</span>`;
+  });
+  $("gaplist").innerHTML = html;
+  const bad = $("gaplist").querySelector(".gap.conflict");
+  if (bad) bad.scrollIntoView({ block: "nearest" });
+}
+
+$("gaplist").addEventListener("click", e => {
+  const g = e.target.closest(".gap");
+  if (!g || g.classList.contains("lock")) return;
+  const i = +g.dataset.gap;
+  if (!gapState[i]) gapState[i] = "must";
+  else if (gapState[i] === "must") gapState[i] = "no";
+  else delete gapState[i];
+  schedule();
+});
+
+function boundaryPayload() {
+  const must_break = [], no_break = [];
+  for (const [k, v] of Object.entries(gapState))
+    (v === "must" ? must_break : no_break).push(+k);
+  must_break.sort((a, b) => a - b);
+  no_break.sort((a, b) => a - b);
+  return { must_break, no_break };
+}
+
 async function run() {
   $("parseError").textContent = "";
   let words, phrases, shots;
@@ -168,9 +249,12 @@ async function run() {
     $("parseError").textContent = e.message;
     $("result").innerHTML = "";
     renderWordList([]);
+    renderGapList([], []);
     return;
   }
   renderWordList(words);
+  pruneGaps(words, phrases);
+  renderGapList(words, phrases);
   if (!words.length) { $("result").innerHTML = '<span class="hint">粘贴词序列后自动计算。</span>'; return; }
 
   const cfg = {};
@@ -180,10 +264,13 @@ async function run() {
   const res = await fetch("/api/segment", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ words, phrases, shots, config: cfg }),
+    body: JSON.stringify({ words, phrases, shots, config: cfg, boundaries: boundaryPayload() }),
   });
   const data = await res.json();
   if (!res.ok) { $("result").innerHTML = `<div class="error">${data.detail || "请求失败"}</div>`; return; }
+  solBreaks = new Set(data.ok ? data.segments.slice(1).map(s => s.word_range[0]) : []);
+  conflictGap = (!data.ok && data.conflict.boundary != null) ? data.conflict.boundary : null;
+  renderGapList(words, phrases);
   render(data);
 }
 
@@ -191,8 +278,11 @@ function render(data) {
   const el = $("result");
   if (!data.ok) {
     const c = data.conflict;
+    const title = c.boundary != null
+      ? `必须断开边界(词间隙 ${c.boundary})不可行 — ${c.side === "left" ? "左侧" : "右侧"}分段冲突`
+      : "无可行方案 — 首个冲突区间";
     el.innerHTML = `<div class="conflict">
-      <h3>无可行方案 — 首个冲突区间</h3>
+      <h3>${title}</h3>
       <p>词下标 <b>${c.word_range[0]}–${c.word_range[1]}</b> · ${fmt(c.start)} → ${fmt(c.end)}</p>
       <p>「${c.text}」</p>
       <ul>${c.reasons.map(r => `<li>${r}</li>`).join("")}</ul>
